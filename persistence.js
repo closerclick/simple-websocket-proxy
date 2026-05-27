@@ -41,6 +41,18 @@ function init(dbFile) {
             bytes       INTEGER NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_offline_pubkey ON offline_queue(pubkey);
+        CREATE TABLE IF NOT EXISTS scheduled_pushes (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            pubkey     TEXT NOT NULL,
+            payload    TEXT,
+            next_fire  INTEGER NOT NULL,
+            cron       TEXT,
+            tz         TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_sched_nextfire ON scheduled_pushes(next_fire);
+        CREATE INDEX IF NOT EXISTS idx_sched_pubkey ON scheduled_pushes(pubkey);
     `);
     return db;
 }
@@ -130,10 +142,51 @@ function deleteExpired(now) {
     db.prepare('DELETE FROM offline_queue WHERE expires_at < ?').run(now);
 }
 
+// ----- scheduled pushes (auto-recordatorios; target = owner pubkey) ------
+
+function insertScheduledPush({ pubkey, payload, nextFire, cron, tz }) {
+    const now = Date.now();
+    const info = db.prepare(`
+        INSERT INTO scheduled_pushes (pubkey, payload, next_fire, cron, tz, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(pubkey, payload || null, nextFire, cron || null, tz || null, now, now);
+    return Number(info.lastInsertRowid);
+}
+
+function listScheduledPushesForPubkey(pubkey) {
+    return db.prepare(`
+        SELECT id, pubkey, payload, next_fire, cron, tz, created_at, updated_at
+        FROM scheduled_pushes WHERE pubkey = ? ORDER BY next_fire ASC
+    `).all(pubkey);
+}
+
+function getScheduledPush(id) {
+    return db.prepare('SELECT * FROM scheduled_pushes WHERE id = ?').get(id);
+}
+
+function deleteScheduledPush(id) {
+    db.prepare('DELETE FROM scheduled_pushes WHERE id = ?').run(id);
+}
+
+function updateScheduledPushNextFire(id, nextFire) {
+    db.prepare('UPDATE scheduled_pushes SET next_fire = ?, updated_at = ? WHERE id = ?')
+        .run(nextFire, Date.now(), id);
+}
+
+function loadDueScheduledPushes(now) {
+    return db.prepare('SELECT * FROM scheduled_pushes WHERE next_fire <= ? ORDER BY next_fire ASC').all(now);
+}
+
 module.exports = {
     init,
     getMeta,
     setMeta,
+    insertScheduledPush,
+    listScheduledPushesForPubkey,
+    getScheduledPush,
+    deleteScheduledPush,
+    updateScheduledPushNextFire,
+    loadDueScheduledPushes,
     loadPushSubscriptions,
     upsertPushSubscription,
     deletePushSubscription,

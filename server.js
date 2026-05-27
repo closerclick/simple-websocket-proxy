@@ -252,11 +252,11 @@ function removePushSubscription(pubkey) {
 
 // Dispara el "timbre" (sin contenido). Best-effort: si la subscription está
 // muerta (404/410) la borramos; el mensaje ya quedó encolado de todos modos.
-function ringPush(pubkey) {
+function ringPush(pubkey, extra) {
     if (!pushEnabled) return;
     const sub = pushSubscriptions.get(pubkey);
     if (!sub) return;
-    const payload = JSON.stringify({ type: 'ring', ts: Date.now() });
+    const payload = JSON.stringify({ type: 'ring', ts: Date.now(), ...(extra || {}) });
     webpush.sendNotification(sub, payload, { TTL: OFFLINE_TTL_MS / 1000 })
         .catch((err) => {
             const code = err && err.statusCode;
@@ -267,6 +267,63 @@ function ringPush(pubkey) {
                 console.error('[push] error enviando timbre:', code || err.message);
             }
         });
+}
+
+// ----- Push programado (auto-recordatorios) ------------------------------
+//
+// Un usuario programa un push A SU PROPIA pubkey (one-shot por timestamp o
+// recurrente por cron+tz). Como target == firmante, no hay vector de abuso:
+// nadie programa pushes a terceros. Al vencer, disparamos el mismo `ringPush`.
+// Política de catch-up: "descartar lo vencido" — si el server estuvo caído,
+// los one-shot vencidos se borran sin disparar y los recurrentes avanzan al
+// próximo futuro (no se dispara nada que venció mientras estábamos abajo).
+const { CronExpressionParser } = require('cron-parser');
+const SCHED_TICK_MS = Number(process.env.SCHED_TICK_MS) || 30 * 1000;
+
+// Próximo disparo futuro (> from) de una expresión cron en una tz. null si inválida.
+function cronNextFire(cron, tz, from) {
+    try {
+        const it = CronExpressionParser.parse(cron, { currentDate: new Date(from), tz: tz || 'UTC' });
+        return it.next().toDate().getTime();
+    } catch (e) {
+        console.error('[sched] cron inválido:', cron, e.message);
+        return null;
+    }
+}
+
+// Al arrancar: reconciliar jobs vencidos SIN disparar (descartar lo vencido).
+function reconcileScheduledPushes() {
+    const now = Date.now();
+    const due = persist.loadDueScheduledPushes(now);
+    for (const job of due) {
+        if (job.cron) {
+            const next = cronNextFire(job.cron, job.tz, now);
+            if (next) persist.updateScheduledPushNextFire(job.id, next);
+            else persist.deleteScheduledPush(job.id);
+        } else {
+            persist.deleteScheduledPush(job.id); // one-shot vencido → descartar
+        }
+    }
+    if (due.length) console.log(`[sched] ${due.length} job(s) vencidos reconciliados al arrancar`);
+}
+
+// Tick del scheduler: dispara los jobs vencidos y reprograma/borra.
+function runScheduledPushes() {
+    const now = Date.now();
+    let due;
+    try { due = persist.loadDueScheduledPushes(now); } catch (e) { console.error('[sched] load error:', e.message); return; }
+    for (const job of due) {
+        let extra;
+        try { extra = job.payload ? JSON.parse(job.payload) : undefined; } catch (_) { extra = undefined; }
+        ringPush(job.pubkey, extra);
+        if (job.cron) {
+            const next = cronNextFire(job.cron, job.tz, now);
+            if (next) persist.updateScheduledPushNextFire(job.id, next);
+            else persist.deleteScheduledPush(job.id);
+        } else {
+            persist.deleteScheduledPush(job.id);
+        }
+    }
 }
 
 // Función para ordenar tokens y crear clave de par
@@ -930,6 +987,15 @@ wss.on('connection', (ws, req) => {
                 applyMessageIds(response, message);
                 ws.send(JSON.stringify(response));
                 return;
+            } else if (message.type === 'schedule-push') {
+                handleSchedulePushMessage(ws, message);
+                return;
+            } else if (message.type === 'cancel-push') {
+                handleCancelPushMessage(ws, message);
+                return;
+            } else if (message.type === 'list-pushes') {
+                handleListPushesMessage(ws, message);
+                return;
             }
             
             // Mensaje regular (to + message) o (to_publickey + message)
@@ -1444,6 +1510,109 @@ wss.on('connection', (ws, req) => {
         }
     }
 
+    // Helper: valida sobre firmado por el vault y devuelve la pubkey (o null).
+    // Self-only: el target SIEMPRE es data.publickey (quien firma).
+    function verifySignedOp(ws, message, op) {
+        const data = message.data;
+        const sig  = message.signature;
+        if (!data || !sig || data.op !== op || !data.publickey || !data.ts) {
+            const e = { type: 'error', error: `Formato ${op} inválido` };
+            applyMessageIds(e, message); ws.send(JSON.stringify(e)); return null;
+        }
+        const skew = Math.abs(Date.now() - Number(data.ts));
+        if (!Number.isFinite(skew) || skew > IDENTIFY_TS_TOLERANCE_MS) {
+            const e = { type: 'error', error: `${op} ts fuera de la ventana ±5min` };
+            applyMessageIds(e, message); ws.send(JSON.stringify(e)); return null;
+        }
+        let jwk;
+        try { jwk = JSON.parse(data.publickey); }
+        catch (_) {
+            const e = { type: 'error', error: `${op}.publickey debe ser JWK serializado` };
+            applyMessageIds(e, message); ws.send(JSON.stringify(e)); return null;
+        }
+        if (!verifySignatureWithJWK(data, sig, jwk)) {
+            const e = { type: 'error', error: `Firma ${op} inválida` };
+            applyMessageIds(e, message); ws.send(JSON.stringify(e)); return null;
+        }
+        return data;
+    }
+
+    // Programar un push a la PROPIA pubkey. data.spec = JSON string con
+    // { fireAt?:ms (one-shot) | cron?:string + tz?:string, payload?:object }.
+    function handleSchedulePushMessage(ws, message) {
+        try {
+            const data = verifySignedOp(ws, message, 'schedule-push');
+            if (!data) return;
+            let spec;
+            try { spec = JSON.parse(data.spec); }
+            catch (_) {
+                const e = { type: 'error', error: 'schedule-push.spec JSON inválido' };
+                applyMessageIds(e, message); ws.send(JSON.stringify(e)); return;
+            }
+            let nextFire;
+            const cron = spec.cron || null;
+            const tz = spec.tz || null;
+            if (cron) {
+                nextFire = cronNextFire(cron, tz, Date.now());
+                if (!nextFire) {
+                    const e = { type: 'error', error: 'cron inválido' };
+                    applyMessageIds(e, message); ws.send(JSON.stringify(e)); return;
+                }
+            } else {
+                nextFire = Number(spec.fireAt);
+                if (!Number.isFinite(nextFire) || nextFire <= Date.now()) {
+                    const e = { type: 'error', error: 'fireAt debe ser un timestamp futuro (ms)' };
+                    applyMessageIds(e, message); ws.send(JSON.stringify(e)); return;
+                }
+            }
+            const payload = spec.payload ? JSON.stringify(spec.payload) : null;
+            const jobId = persist.insertScheduledPush({ pubkey: data.publickey, payload, nextFire, cron, tz });
+            const response = { type: 'push-scheduled', jobId, nextFire };
+            applyMessageIds(response, message);
+            ws.send(JSON.stringify(response));
+        } catch (e) {
+            console.error('handleSchedulePushMessage error:', e);
+        }
+    }
+
+    // Cancelar un job propio. data.jobId.
+    function handleCancelPushMessage(ws, message) {
+        try {
+            const data = verifySignedOp(ws, message, 'cancel-push');
+            if (!data) return;
+            const jobId = Number(data.jobId);
+            const job = persist.getScheduledPush(jobId);
+            // Self-only: solo podés cancelar tus propios jobs.
+            if (job && job.pubkey === data.publickey) persist.deleteScheduledPush(jobId);
+            const response = { type: 'push-canceled', jobId };
+            applyMessageIds(response, message);
+            ws.send(JSON.stringify(response));
+        } catch (e) {
+            console.error('handleCancelPushMessage error:', e);
+        }
+    }
+
+    // Listar los jobs propios.
+    function handleListPushesMessage(ws, message) {
+        try {
+            const data = verifySignedOp(ws, message, 'list-pushes');
+            if (!data) return;
+            const rows = persist.listScheduledPushesForPubkey(data.publickey);
+            const jobs = rows.map(r => ({
+                jobId: r.id,
+                nextFire: r.next_fire,
+                cron: r.cron || null,
+                tz: r.tz || null,
+                payload: r.payload ? JSON.parse(r.payload) : null
+            }));
+            const response = { type: 'push-list', jobs };
+            applyMessageIds(response, message);
+            ws.send(JSON.stringify(response));
+        } catch (e) {
+            console.error('handleListPushesMessage error:', e);
+        }
+    }
+
     function handlePubkeyAddressedMessage(ws, message, targetPubkeys) {
         const senderPubkey = tokenToPubkey.get(ws.token) || null;
         const now = Date.now();
@@ -1554,6 +1723,7 @@ wss.on('connection', (ws, req) => {
 let channelCleanupInterval = null;
 let tokenCleanupInterval = null;
 let offlineQueueInterval = null;
+let scheduledPushInterval = null;
 
 /**
  * Inicia el servidor en el puerto indicado.
@@ -1565,6 +1735,9 @@ function start(port = Number(PORT)) {
         channelCleanupInterval = setInterval(cleanupExpiredChannelEntries, 60 * 1000);
         tokenCleanupInterval = tokenManager.startCleanupInterval(5);
         offlineQueueInterval = setInterval(cleanupOfflineQueues, 60 * 1000);
+        // Push programado: descartar lo vencido al arrancar y luego tick periódico.
+        reconcileScheduledPushes();
+        scheduledPushInterval = setInterval(runScheduledPushes, SCHED_TICK_MS);
 
         const onError = (err) => {
             server.removeListener('error', onError);
@@ -1602,6 +1775,10 @@ function stop() {
     if (offlineQueueInterval) {
         clearInterval(offlineQueueInterval);
         offlineQueueInterval = null;
+    }
+    if (scheduledPushInterval) {
+        clearInterval(scheduledPushInterval);
+        scheduledPushInterval = null;
     }
     if (tokenCleanupInterval) {
         clearInterval(tokenCleanupInterval);
