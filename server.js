@@ -40,7 +40,13 @@ const CHANNEL_ENTRY_EXPIRY_MS = 20 * 60 * 1000; // 20 minutos
 // identifique drena la cola completa y se borra (los demás no la verán).
 const pubkeyToTokens = new Map();   // publickey JWK string -> Set<token>
 const tokenToPubkey = new Map();    // token -> publickey JWK string (1:1)
-const offlineQueues = new Map();    // publickey -> array<QueuedMsg>
+
+// Persistencia durable (SQLite nativo). Solo lo no-efímero: la cola offline y
+// las push subscriptions. Los Maps en RAM son el working set; SQLite el
+// respaldo (write-through). Los mapas token<->pubkey NO se persisten.
+const persist = require('./persistence');
+const DB_FILE = process.env.PROXY_DB_FILE || './proxy-data.db';
+persist.init(DB_FILE);
 
 const OFFLINE_TTL_MS = 24 * 60 * 60 * 1000;          // 1 día
 const IDENTIFY_TS_TOLERANCE_MS = 5 * 60 * 1000;       // ±5 min
@@ -48,6 +54,16 @@ const MAX_QUEUE_PER_PUBKEY = 200;                     // mensajes
 const MAX_BYTES_PER_PUBKEY = 1 * 1024 * 1024;         // 1 MB por destinatario
 const MAX_TOTAL_QUEUE_BYTES = 64 * 1024 * 1024;       // 64 MB totales
 let totalQueueBytes = 0;
+
+// publickey -> array<QueuedMsg>. Cada QueuedMsg lleva su `id` de fila SQLite
+// para poder borrarlo del disco al entregar/evictar. Se rehidrata al arrancar.
+const offlineQueues = persist.loadOfflineQueue(Date.now());
+for (const q of offlineQueues.values()) {
+    for (const item of q) totalQueueBytes += item.bytes || 0;
+}
+if (offlineQueues.size) {
+    console.log(`[persist] cola offline rehidratada: ${offlineQueues.size} pubkey(s), ${totalQueueBytes} bytes`);
+}
 
 function bytesOfMessage(m) {
     try { return Buffer.byteLength(typeof m === 'string' ? m : JSON.stringify(m), 'utf8'); }
@@ -57,16 +73,20 @@ function bytesOfMessage(m) {
 function trimQueueByCaps(pubkey) {
     const q = offlineQueues.get(pubkey);
     if (!q) return;
+    const droppedIds = [];
     while (q.length > MAX_QUEUE_PER_PUBKEY) {
         const dropped = q.shift();
         totalQueueBytes -= dropped.bytes || 0;
+        if (dropped.id != null) droppedIds.push(dropped.id);
     }
     let bytes = q.reduce((a, x) => a + (x.bytes || 0), 0);
     while (bytes > MAX_BYTES_PER_PUBKEY && q.length) {
         const dropped = q.shift();
         bytes -= dropped.bytes || 0;
         totalQueueBytes -= dropped.bytes || 0;
+        if (dropped.id != null) droppedIds.push(dropped.id);
     }
+    persist.deleteQueuedByIds(droppedIds);
     if (q.length === 0) offlineQueues.delete(pubkey);
 }
 
@@ -74,6 +94,7 @@ function evictGloballyIfOverCap() {
     if (totalQueueBytes <= MAX_TOTAL_QUEUE_BYTES) return;
     // Encuentra entradas más viejas a través de todas las colas y descarta
     // hasta volver bajo el límite.
+    const droppedIds = [];
     while (totalQueueBytes > MAX_TOTAL_QUEUE_BYTES) {
         let oldestPk = null;
         let oldestTs = Infinity;
@@ -86,11 +107,16 @@ function evictGloballyIfOverCap() {
         if (!oldestPk) break;
         const dropped = offlineQueues.get(oldestPk).shift();
         totalQueueBytes -= dropped.bytes || 0;
+        if (dropped.id != null) droppedIds.push(dropped.id);
         if (offlineQueues.get(oldestPk).length === 0) offlineQueues.delete(oldestPk);
     }
+    persist.deleteQueuedByIds(droppedIds);
 }
 
 function enqueueOffline(recipientPubkey, queued) {
+    // Persistir primero para obtener el id de fila; así un evict/flush posterior
+    // puede borrarlo del disco.
+    queued.id = persist.insertQueued(recipientPubkey, queued);
     if (!offlineQueues.has(recipientPubkey)) offlineQueues.set(recipientPubkey, []);
     offlineQueues.get(recipientPubkey).push(queued);
     totalQueueBytes += queued.bytes || 0;
@@ -120,7 +146,9 @@ function flushOfflineFor(pubkey, ws) {
         }
         totalQueueBytes -= item.bytes || 0;
     }
+    // Entregada (o expirada) toda la cola de esta pubkey: borrar de RAM y disco.
     offlineQueues.delete(pubkey);
+    persist.deleteQueuedForPubkey(pubkey);
     return delivered;
 }
 
@@ -128,13 +156,17 @@ function cleanupOfflineQueues() {
     const now = Date.now();
     for (const [pk, q] of Array.from(offlineQueues.entries())) {
         let i = 0;
+        const expiredIds = [];
         while (i < q.length && q[i].expiresAt < now) {
             totalQueueBytes -= q[i].bytes || 0;
+            if (q[i].id != null) expiredIds.push(q[i].id);
             i++;
         }
         if (i > 0) q.splice(0, i);
+        persist.deleteQueuedByIds(expiredIds);
         if (q.length === 0) offlineQueues.delete(pk);
     }
+    persist.deleteExpired(now);
 }
 
 function bindPubkey(publickey, token) {
@@ -152,6 +184,89 @@ function unbindPubkeyFromToken(token) {
         set.delete(token);
         if (set.size === 0) pubkeyToTokens.delete(pk);
     }
+}
+
+// ----- Web Push ("timbre" para destinatarios offline) --------------------
+//
+// Cuando un mensaje cae a la cola offline, además de encolarlo enviamos un
+// Web Push *sin contenido de usuario* ("ring") para que el Service Worker del
+// destinatario despierte, reconecte al proxy y baje su cola cifrada. El push
+// pasa por el push service del navegador (FCM en Android), que ve solo el
+// metadato del timbre, nunca el contenido. NO usamos el SDK de Firebase: solo
+// el Web Push Protocol estándar con VAPID. La subscription la controla la PWA
+// (subscribe/unsubscribe firmados); aquí solo guardamos la copia que el
+// servidor necesita para poder timbrar. Persiste en SQLite (ver persistence.js).
+const webpush = require('web-push');
+
+const VAPID_SUBJECT = process.env.VAPID_SUBJECT || 'mailto:admin@closer.click';
+
+// Resolución de claves VAPID, en orden de prioridad:
+//   1. .env (VAPID_PUBLIC_KEY + VAPID_PRIVATE_KEY) — control explícito.
+//   2. Par persistido en SQLite (meta) de un arranque anterior.
+//   3. Autogenerar una vez y persistir. Así el proxy es zero-config y las
+//      claves se mantienen ESTABLES entre reinicios (regenerarlas invalidaría
+//      todas las subscriptions existentes).
+function resolveVapidKeys() {
+    const envPub = process.env.VAPID_PUBLIC_KEY || '';
+    const envPriv = process.env.VAPID_PRIVATE_KEY || '';
+    if (envPub && envPriv) {
+        return { publicKey: envPub, privateKey: envPriv, source: '.env' };
+    }
+    const storedPub = persist.getMeta('vapid_public_key');
+    const storedPriv = persist.getMeta('vapid_private_key');
+    if (storedPub && storedPriv) {
+        return { publicKey: storedPub, privateKey: storedPriv, source: 'sqlite' };
+    }
+    const gen = webpush.generateVAPIDKeys();
+    persist.setMeta('vapid_public_key', gen.publicKey);
+    persist.setMeta('vapid_private_key', gen.privateKey);
+    return { publicKey: gen.publicKey, privateKey: gen.privateKey, source: 'autogenerado' };
+}
+
+const _vapid = resolveVapidKeys();
+const VAPID_PUBLIC_KEY  = _vapid.publicKey;
+const VAPID_PRIVATE_KEY = _vapid.privateKey;
+const pushEnabled = !!(VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY);
+if (pushEnabled) {
+    webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
+    console.log(`[push] Web Push habilitado (VAPID ${_vapid.source}).`);
+} else {
+    console.warn('[push] VAPID no disponible: el timbre push queda deshabilitado (la cola offline sigue funcionando).');
+}
+
+// publickey JWK string -> PushSubscription. Working set en RAM, respaldado en
+// SQLite (write-through). Rehidratado al arrancar.
+const pushSubscriptions = persist.loadPushSubscriptions();
+if (pushSubscriptions.size) {
+    console.log(`[push] ${pushSubscriptions.size} subscription(s) rehidratadas de SQLite`);
+}
+
+function setPushSubscription(pubkey, subscription) {
+    pushSubscriptions.set(pubkey, subscription);
+    persist.upsertPushSubscription(pubkey, subscription);
+}
+
+function removePushSubscription(pubkey) {
+    if (pushSubscriptions.delete(pubkey)) persist.deletePushSubscription(pubkey);
+}
+
+// Dispara el "timbre" (sin contenido). Best-effort: si la subscription está
+// muerta (404/410) la borramos; el mensaje ya quedó encolado de todos modos.
+function ringPush(pubkey) {
+    if (!pushEnabled) return;
+    const sub = pushSubscriptions.get(pubkey);
+    if (!sub) return;
+    const payload = JSON.stringify({ type: 'ring', ts: Date.now() });
+    webpush.sendNotification(sub, payload, { TTL: OFFLINE_TTL_MS / 1000 })
+        .catch((err) => {
+            const code = err && err.statusCode;
+            if (code === 404 || code === 410) {
+                removePushSubscription(pubkey);
+                console.log(`[push] subscription expirada (${code}) borrada para una pubkey`);
+            } else {
+                console.error('[push] error enviando timbre:', code || err.message);
+            }
+        });
 }
 
 // Función para ordenar tokens y crear clave de par
@@ -800,6 +915,21 @@ wss.on('connection', (ws, req) => {
             } else if (message.type === 'identify') {
                 handleIdentifyMessage(ws, message);
                 return;
+            } else if (message.type === 'push-subscribe') {
+                handlePushSubscribeMessage(ws, message);
+                return;
+            } else if (message.type === 'push-unsubscribe') {
+                handlePushUnsubscribeMessage(ws, message);
+                return;
+            } else if (message.type === 'push-config') {
+                const response = {
+                    type: 'push-config',
+                    enabled: pushEnabled,
+                    vapidPublicKey: pushEnabled ? VAPID_PUBLIC_KEY : null
+                };
+                applyMessageIds(response, message);
+                ws.send(JSON.stringify(response));
+                return;
             }
             
             // Mensaje regular (to + message) o (to_publickey + message)
@@ -1234,6 +1364,86 @@ wss.on('connection', (ws, req) => {
         }
     }
 
+    // Registrar/actualizar la push subscription de una pubkey. El sobre va
+    // firmado por el vault (misma verificación que identify): la firma prueba
+    // que quien envía la subscription es dueño de esa pubkey.
+    //   data: { op:'push-subscribe', publickey, subscription, ts }
+    function handlePushSubscribeMessage(ws, message) {
+        try {
+            const data = message.data;
+            const sig  = message.signature;
+            if (!data || !sig || data.op !== 'push-subscribe' || !data.publickey || !data.subscription || !data.ts) {
+                const e = { type: 'error', error: 'Formato push-subscribe inválido (esperado data:{op:"push-subscribe",publickey,subscription,ts}+signature)' };
+                applyMessageIds(e, message); ws.send(JSON.stringify(e)); return;
+            }
+            const skew = Math.abs(Date.now() - Number(data.ts));
+            if (!Number.isFinite(skew) || skew > IDENTIFY_TS_TOLERANCE_MS) {
+                const e = { type: 'error', error: 'push-subscribe ts fuera de la ventana ±5min' };
+                applyMessageIds(e, message); ws.send(JSON.stringify(e)); return;
+            }
+            let pubKeyJwk;
+            try { pubKeyJwk = JSON.parse(data.publickey); }
+            catch (_) {
+                const e = { type: 'error', error: 'push-subscribe.publickey debe ser JWK serializado' };
+                applyMessageIds(e, message); ws.send(JSON.stringify(e)); return;
+            }
+            if (!verifySignatureWithJWK(data, sig, pubKeyJwk)) {
+                const e = { type: 'error', error: 'Firma push-subscribe inválida' };
+                applyMessageIds(e, message); ws.send(JSON.stringify(e)); return;
+            }
+            // La subscription viaja como string JSON (sobre plano => firma canónica
+            // idéntica entre cliente/vault/servidor). La parseamos para guardarla.
+            let subscription = data.subscription;
+            if (typeof subscription === 'string') {
+                try { subscription = JSON.parse(subscription); }
+                catch (_) {
+                    const e = { type: 'error', error: 'push-subscribe.subscription JSON inválido' };
+                    applyMessageIds(e, message); ws.send(JSON.stringify(e)); return;
+                }
+            }
+            setPushSubscription(data.publickey, subscription);
+            const response = { type: 'push-subscribed', publickey: data.publickey };
+            applyMessageIds(response, message);
+            ws.send(JSON.stringify(response));
+        } catch (e) {
+            console.error('handlePushSubscribeMessage error:', e);
+        }
+    }
+
+    // Borrar la push subscription de una pubkey (la PWA desactiva notifs).
+    //   data: { op:'push-unsubscribe', publickey, ts }
+    function handlePushUnsubscribeMessage(ws, message) {
+        try {
+            const data = message.data;
+            const sig  = message.signature;
+            if (!data || !sig || data.op !== 'push-unsubscribe' || !data.publickey || !data.ts) {
+                const e = { type: 'error', error: 'Formato push-unsubscribe inválido' };
+                applyMessageIds(e, message); ws.send(JSON.stringify(e)); return;
+            }
+            const skew = Math.abs(Date.now() - Number(data.ts));
+            if (!Number.isFinite(skew) || skew > IDENTIFY_TS_TOLERANCE_MS) {
+                const e = { type: 'error', error: 'push-unsubscribe ts fuera de la ventana ±5min' };
+                applyMessageIds(e, message); ws.send(JSON.stringify(e)); return;
+            }
+            let pubKeyJwk;
+            try { pubKeyJwk = JSON.parse(data.publickey); }
+            catch (_) {
+                const e = { type: 'error', error: 'push-unsubscribe.publickey debe ser JWK serializado' };
+                applyMessageIds(e, message); ws.send(JSON.stringify(e)); return;
+            }
+            if (!verifySignatureWithJWK(data, sig, pubKeyJwk)) {
+                const e = { type: 'error', error: 'Firma push-unsubscribe inválida' };
+                applyMessageIds(e, message); ws.send(JSON.stringify(e)); return;
+            }
+            removePushSubscription(data.publickey);
+            const response = { type: 'push-unsubscribed', publickey: data.publickey };
+            applyMessageIds(response, message);
+            ws.send(JSON.stringify(response));
+        } catch (e) {
+            console.error('handlePushUnsubscribeMessage error:', e);
+        }
+    }
+
     function handlePubkeyAddressedMessage(ws, message, targetPubkeys) {
         const senderPubkey = tokenToPubkey.get(ws.token) || null;
         const now = Date.now();
@@ -1285,6 +1495,9 @@ wss.on('connection', (ws, req) => {
                     bytes
                 });
                 queued.push(pk);
+                // Timbre push (sin contenido): despierta al SW del destinatario
+                // para que reconecte y baje su cola. Best-effort.
+                ringPush(pk);
             }
         }
         if (queued.length || failed.length) {

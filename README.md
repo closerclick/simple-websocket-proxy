@@ -15,15 +15,28 @@ Un servidor WebSocket proxy que implementa las 4 reglas especificadas en `defini
 - **Identidad opt-in (`identify`)**: bind de una pubkey ECDSA estable al token actual mediante un sobre firmado.
 - **Direccionamiento por pubkey (`to_publickey`)**: una vez identificadas las partes, el sender direcciona por pubkey en lugar de token.
 - **Fan-out multi-instancia**: el proxy mantiene `pubkey → Set<token>` y entrega cada mensaje a todas las instancias activas de la misma pubkey (web + extensión + tabs + móvil simultáneamente).
-- **Cola offline 24 h**: si ninguna instancia de la pubkey está conectada, el mensaje queda en memoria hasta 24 h. Caps: 200 msgs / 1 MB por pubkey, 64 MB global con eviction oldest-first. **Single-drain**: el primer cliente que identifica drena la cola y se borra.
+- **Cola offline 24 h**: si ninguna instancia de la pubkey está conectada, el mensaje queda encolado hasta 24 h. Caps: 200 msgs / 1 MB por pubkey, 64 MB global con eviction oldest-first. **Single-drain**: el primer cliente que identifica drena la cola y se borra.
+- **Web Push ("timbre")**: si una pubkey offline tiene una push subscription registrada, además de encolar el proxy envía un Web Push **sin contenido** (VAPID, estándar, sin SDK de Firebase) que despierta al Service Worker del destinatario para que reconecte y baje su cola. Ver `enablePush()` en `@gatoseya/closer-click-proxy-client`.
 - **Rate limit de dos niveles** por (token, type): soft → `abuse_notice` a los receptores, hard → cierre de conexión + ban de IP 30 min.
-- **Sin disco**: todo el estado vive en memoria del proceso.
+- **Persistencia durable (SQLite nativo)**: la cola offline y las push subscriptions se respaldan en SQLite (`node:sqlite`, write-through) y se rehidratan al arrancar. Los mapas token↔pubkey y los canales siguen siendo efímeros (RAM), por diseño.
 
 ## Instalación
 
 ```bash
 npm install
+cp .env.example .env   # luego completá las claves VAPID
 ```
+
+### Configuración (`.env`)
+
+| Variable | Descripción |
+|----------|-------------|
+| `PORT` | Puerto del servidor (default 4001). |
+| `VAPID_PUBLIC_KEY` / `VAPID_PRIVATE_KEY` | Par VAPID para Web Push. **Opcional**: si faltan, el proxy autogenera un par la primera vez y lo persiste en SQLite (estable entre reinicios). Definilas solo para control explícito o para compartir el par entre varias instancias. Generar manualmente: `node -e "console.log(require('web-push').generateVAPIDKeys())"`. |
+| `VAPID_SUBJECT` | Contacto para el header VAPID (`mailto:` o `https:`). |
+| `PROXY_DB_FILE` | Archivo SQLite de persistencia durable (default `./proxy-data.db`). |
+
+> **Requiere Node ≥ 22.5** por el módulo nativo `node:sqlite`.
 
 ## Uso
 

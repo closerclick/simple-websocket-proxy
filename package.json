@@ -12,8 +12,9 @@
     "test:watch": "vitest"
   },
   "dependencies": {
-    "ws": "^8.14.2",
-    "dotenv": "^16.0.0"
+    "dotenv": "^16.0.0",
+    "web-push": "^3.6.7",
+    "ws": "^8.14.2"
   },
   "devDependencies": {
     "nodemon": "^3.0.0",
@@ -22,7 +23,11 @@
   "engines": {
     "node": ">=14.0.0"
   },
-  "keywords": ["websocket", "proxy", "ws"],
+  "keywords": [
+    "websocket",
+    "proxy",
+    "ws"
+  ],
   "author": "",
   "license": "MIT"
 }
