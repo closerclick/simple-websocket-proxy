@@ -14,7 +14,7 @@ Web Push (timbre) y la persistencia SQLite agregados en esta versión.
 
 ```bash
 # en el servidor
-git clone git@github.com:seyacat/simple-websocket-proxy.git
+git clone git@github.com:closerclick/simple-websocket-proxy.git
 cd simple-websocket-proxy
 npm ci                 # instala deps exactas (ws, dotenv, web-push)
 cp .env.example .env   # opcional: editar si querés config explícita
@@ -44,13 +44,13 @@ After=network.target
 [Service]
 Type=simple
 User=seyacat
-WorkingDirectory=/home/seyacat/simple-websocket-proxy
+WorkingDirectory=/home/closerclick/simple-websocket-proxy
 ExecStart=/usr/bin/env node server.js
 Restart=always
 RestartSec=3
 # Node >= 22.5 en PATH; si usás nvm, apuntá al binario absoluto:
-# ExecStart=/home/seyacat/.nvm/versions/node/v22.x/bin/node server.js
-EnvironmentFile=/home/seyacat/simple-websocket-proxy/.env
+# ExecStart=/home/closerclick/.nvm/versions/node/v22.x/bin/node server.js
+EnvironmentFile=/home/closerclick/simple-websocket-proxy/.env
 
 [Install]
 WantedBy=multi-user.target
@@ -89,7 +89,7 @@ server {
 }
 ```
 
-El cliente usa `wss://proxy.closer.click` (default de `@gatoseya/closer-click-proxy-client`).
+El cliente usa `wss://proxy.closer.click` (default de `@closerclick/closer-click-proxy-client`).
 
 ## 5. Persistencia y backups
 
@@ -108,7 +108,7 @@ Recomendaciones:
 ## 6. Actualizar (deploy de nueva versión)
 
 ```bash
-cd /home/seyacat/simple-websocket-proxy
+cd /home/closerclick/simple-websocket-proxy
 git pull
 npm ci
 sudo systemctl restart closerclick-proxy
