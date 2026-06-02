@@ -1691,15 +1691,16 @@ wss.on('connection', (ws, req) => {
                 if (anySent) sentInline.push(pk);
                 else failed.push(pk);
             } else if (PROXY_PEERS.length) {
-                // Federación: no hay instancias locales → reenviar a la malla.
-                // El home (u otra instancia online en un peer) entrega/encola.
-                // Encolamos acá SÓLO si este proxy es el home de pk.
+                // Federación: no hay instancias locales → reenviar a la malla (un
+                // peer puede tener al destinatario online, o ser su home y encolar).
+                // ADEMÁS encolamos local como FALLBACK para no perder el mensaje si
+                // el home aún no se conoce (la app dedup por `mid`). El receptor
+                // federado, en cambio, solo encola si es home (evita acumular en
+                // proxies intermedios).
                 forwardToPeers(pk, message.message, senderPubkey, now, expiresAt);
-                if (isHome(pk)) {
-                    const bytes = bytesOfMessage(message.message);
-                    enqueueOffline(pk, { from: ws.token, fromPubkey: senderPubkey, message: message.message, queuedAt: now, expiresAt, bytes });
-                    ringPush(pk);
-                }
+                const bytes = bytesOfMessage(message.message);
+                enqueueOffline(pk, { from: ws.token, fromPubkey: senderPubkey, message: message.message, queuedAt: now, expiresAt, bytes });
+                ringPush(pk);
                 queued.push(pk);
             } else {
                 // Sin federación: comportamiento actual (cola offline 24h single-drain).
