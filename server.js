@@ -858,9 +858,14 @@ function validateSignatureBasic(channelData) {
     return true;
 }
 
-// Crear servidor HTTP básico (solo para WebSocket upgrade)
+// Crear servidor HTTP básico (WebSocket upgrade + healthcheck)
 const server = http.createServer((req, res) => {
-    // Para cualquier ruta, responder 404 (no necesitamos endpoints HTTP)
+    if (req.url === '/health') {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+        return;
+    }
+    // Para cualquier otra ruta, 404 (el proxy es WebSocket; no expone HTTP).
     res.writeHead(404);
     res.end();
 });
