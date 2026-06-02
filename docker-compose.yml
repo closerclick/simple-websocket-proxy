@@ -12,7 +12,9 @@
 
 services:
   proxy:
-    build: .
+    image: ghcr.io/closerclick/simple-websocket-proxy:latest
+    # Para compilar de fuente en vez de bajar la imagen: comentá `image` y descomentá:
+    # build: .
     environment:
       PORT: 4001
       PROXY_DB_FILE: /data/proxy-data.db
