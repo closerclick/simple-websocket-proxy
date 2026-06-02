@@ -53,8 +53,32 @@ function init(dbFile) {
         );
         CREATE INDEX IF NOT EXISTS idx_sched_nextfire ON scheduled_pushes(next_fire);
         CREATE INDEX IF NOT EXISTS idx_sched_pubkey ON scheduled_pushes(pubkey);
+        CREATE TABLE IF NOT EXISTS home_registrations (
+            pubkey     TEXT PRIMARY KEY,
+            updated_at INTEGER NOT NULL
+        );
     `);
     return db;
+}
+
+// ----- home registrations (federación: "soy el home de esta pubkey") -----
+// Se upsertea en cada identify; con TTL para olvidar identidades que ya no usan
+// este proxy. Permite que, al recibir un mensaje federado, sólo el HOME encole.
+
+function upsertHome(pubkey, now) {
+    db.prepare(`
+        INSERT INTO home_registrations (pubkey, updated_at) VALUES (?, ?)
+        ON CONFLICT(pubkey) DO UPDATE SET updated_at = excluded.updated_at
+    `).run(pubkey, now);
+}
+
+function loadHomes(minUpdatedAt) {
+    return db.prepare('SELECT pubkey FROM home_registrations WHERE updated_at >= ?')
+        .all(minUpdatedAt).map(r => r.pubkey);
+}
+
+function deleteExpiredHomes(cutoff) {
+    db.prepare('DELETE FROM home_registrations WHERE updated_at < ?').run(cutoff);
 }
 
 // ----- meta (clave-valor para config persistida, p.ej. VAPID) ------------
@@ -106,11 +130,13 @@ function loadOfflineQueue(now) {
     const out = new Map();
     for (const r of rows) {
         if (!out.has(r.pubkey)) out.set(r.pubkey, []);
+        let message = r.message;
+        try { message = JSON.parse(r.message); } catch (_) { /* fila legacy en texto plano */ }
         out.get(r.pubkey).push({
             id: r.id,
             from: r.from_token,
             fromPubkey: r.from_pubkey,
-            message: r.message,
+            message,
             queuedAt: r.queued_at,
             expiresAt: r.expires_at,
             bytes: r.bytes
@@ -121,10 +147,13 @@ function loadOfflineQueue(now) {
 
 // Inserta una fila y devuelve su id (para poder borrarla luego en flush/evict).
 function insertQueued(pubkey, item) {
+    // `message` puede ser objeto; SQLite solo bindea texto/números → serializamos
+    // siempre a JSON (y se parsea al rehidratar). Round-trip estable.
+    const msgText = JSON.stringify(item.message);
     const info = db.prepare(`
         INSERT INTO offline_queue (pubkey, from_token, from_pubkey, message, queued_at, expires_at, bytes)
         VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(pubkey, item.from || null, item.fromPubkey || null, item.message, item.queuedAt, item.expiresAt, item.bytes || 0);
+    `).run(pubkey, item.from || null, item.fromPubkey || null, msgText, item.queuedAt, item.expiresAt, item.bytes || 0);
     return Number(info.lastInsertRowid);
 }
 
@@ -195,4 +224,7 @@ module.exports = {
     deleteQueuedByIds,
     deleteQueuedForPubkey,
     deleteExpired,
+    upsertHome,
+    loadHomes,
+    deleteExpiredHomes,
 };

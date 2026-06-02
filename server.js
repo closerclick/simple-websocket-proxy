@@ -50,6 +50,65 @@ persist.init(DB_FILE);
 
 const OFFLINE_TTL_MS = 24 * 60 * 60 * 1000;          // 1 día
 const IDENTIFY_TS_TOLERANCE_MS = 5 * 60 * 1000;       // ±5 min
+
+// --- Federación s2s (opcional): reenviar mensajes por pubkey a proxies peer. ---
+// Apagada si PROXY_PEERS está vacío → el proxy se comporta EXACTAMENTE como antes.
+const PROXY_PEERS = (process.env.PROXY_PEERS || '').split(',').map(s => s.trim().replace(/\/+$/, '')).filter(Boolean);
+const FED_TOKEN = process.env.PROXY_FEDERATION_TOKEN || '';
+const HOME_TTL_MS = Number(process.env.PROXY_HOME_TTL_MS || 7 * 24 * 60 * 60 * 1000); // 7 días
+// "Soy el home de estas pubkeys" (identificaron acá). Set en RAM + respaldo SQLite.
+const homePubkeys = new Set(persist.loadHomes(Date.now() - HOME_TTL_MS));
+function registerHome(pubkey) {
+    homePubkeys.add(pubkey);
+    try { persist.upsertHome(pubkey, Date.now()); } catch (_) {}
+}
+// ¿Este proxy es responsable de encolar para pubkey? (identificó acá, o está online acá)
+function isHome(pubkey) { return homePubkeys.has(pubkey) || pubkeyToTokens.has(pubkey); }
+
+// Reenvía un mensaje por pubkey a todos los peers (fire-and-forget). El payload
+// va opaco (cifrado E2E por el cliente); los proxies son tránsito ciego.
+function forwardToPeers(toPubkey, msgBody, fromPubkey, queuedAt, expiresAt) {
+    if (!PROXY_PEERS.length) return;
+    const body = JSON.stringify({ toPubkey, fromPubkey, message: msgBody, queuedAt, expiresAt });
+    for (const peer of PROXY_PEERS) {
+        const ctrl = new AbortController();
+        const t = setTimeout(() => ctrl.abort(), 5000);
+        fetch(`${peer}/federate`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', ...(FED_TOKEN ? { 'x-proxy-token': FED_TOKEN } : {}) },
+            body, signal: ctrl.signal
+        }).catch(e => console.warn(`[fed] forward a ${peer} falló:`, e.message)).finally(() => clearTimeout(t));
+    }
+}
+
+// Aplica un mensaje federado recibido de un peer: entrega a instancias locales,
+// o encola SÓLO si este proxy es el home del destinatario. NO re-reenvía (sin loops).
+function deliverFederated(toPubkey, msgBody, fromPubkey, queuedAt, expiresAt) {
+    const set = pubkeyToTokens.get(toPubkey);
+    let delivered = 0;
+    if (set) {
+        for (const tk of set) {
+            const conn = activeConnections.get(tk);
+            if (!conn) continue;
+            try {
+                conn.ws.send(JSON.stringify({ type: 'message', from: null, from_publickey: fromPubkey, message: msgBody }));
+                delivered++;
+            } catch (_) {}
+        }
+    }
+    if (delivered > 0) return { delivered };
+    if (isHome(toPubkey)) {
+        const bytes = bytesOfMessage(msgBody);
+        enqueueOffline(toPubkey, {
+            from: null, fromPubkey, message: msgBody,
+            queuedAt: queuedAt || Date.now(),
+            expiresAt: expiresAt || (Date.now() + OFFLINE_TTL_MS), bytes
+        });
+        ringPush(toPubkey);
+        return { queued: true };
+    }
+    return { dropped: true };
+}
 const MAX_QUEUE_PER_PUBKEY = 200;                     // mensajes
 const MAX_BYTES_PER_PUBKEY = 1 * 1024 * 1024;         // 1 MB por destinatario
 const MAX_TOTAL_QUEUE_BYTES = 64 * 1024 * 1024;       // 64 MB totales
@@ -858,11 +917,30 @@ function validateSignatureBasic(channelData) {
     return true;
 }
 
-// Crear servidor HTTP básico (WebSocket upgrade + healthcheck)
+// Crear servidor HTTP básico (WebSocket upgrade + healthcheck + federación s2s)
 const server = http.createServer((req, res) => {
     if (req.url === '/health') {
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ ok: true }));
+        return;
+    }
+    // Federación: un peer nos reenvía un mensaje por pubkey. Lo entregamos a
+    // instancias locales o lo encolamos si somos el home. NO re-reenviamos.
+    if (req.url === '/federate' && req.method === 'POST') {
+        if (FED_TOKEN && req.headers['x-proxy-token'] !== FED_TOKEN) { res.writeHead(401); res.end(); return; }
+        let size = 0; const chunks = [];
+        req.on('data', c => { size += c.length; if (size > 2 * 1024 * 1024) { req.destroy(); } else chunks.push(c); });
+        req.on('end', () => {
+            try {
+                const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+                const { toPubkey, fromPubkey, message, queuedAt, expiresAt } = body || {};
+                if (typeof toPubkey !== 'string' || message === undefined) { res.writeHead(400); res.end(); return; }
+                const r = deliverFederated(toPubkey, message, fromPubkey || null, queuedAt, expiresAt);
+                res.writeHead(200, { 'content-type': 'application/json' });
+                res.end(JSON.stringify({ ok: true, ...r }));
+            } catch (_) { res.writeHead(400); res.end(); }
+        });
+        req.on('error', () => { try { res.writeHead(400); res.end(); } catch (_) {} });
         return;
     }
     // Para cualquier otra ruta, 404 (el proxy es WebSocket; no expone HTTP).
@@ -1420,6 +1498,9 @@ wss.on('connection', (ws, req) => {
                 !pubkeyToTokens.has(data.publickey) ||
                 pubkeyToTokens.get(data.publickey).size === 0;
             bindPubkey(data.publickey, ws.token);
+            // Federación: este proxy queda registrado como "home" de esta pubkey
+            // (persistente con TTL), para encolar sus mensajes federados offline.
+            registerHome(data.publickey);
 
             const delivered = wasFirstInstance ? flushOfflineFor(data.publickey, ws) : 0;
             const response = { type: 'identified', publickey: data.publickey, queued_delivered: delivered };
@@ -1657,8 +1738,19 @@ wss.on('connection', (ws, req) => {
                 }
                 if (anySent) sentInline.push(pk);
                 else failed.push(pk);
+            } else if (PROXY_PEERS.length) {
+                // Federación: no hay instancias locales → reenviar a la malla.
+                // El home (u otra instancia online en un peer) entrega/encola.
+                // Encolamos acá SÓLO si este proxy es el home de pk.
+                forwardToPeers(pk, message.message, senderPubkey, now, expiresAt);
+                if (isHome(pk)) {
+                    const bytes = bytesOfMessage(message.message);
+                    enqueueOffline(pk, { from: ws.token, fromPubkey: senderPubkey, message: message.message, queuedAt: now, expiresAt, bytes });
+                    ringPush(pk);
+                }
+                queued.push(pk);
             } else {
-                // Sin instancias activas: cola offline (24h, single-drain)
+                // Sin federación: comportamiento actual (cola offline 24h single-drain).
                 const bytes = bytesOfMessage(message.message);
                 enqueueOffline(pk, {
                     from: ws.token,
@@ -1743,6 +1835,16 @@ function start(port = Number(PORT)) {
         // Push programado: descartar lo vencido al arrancar y luego tick periódico.
         reconcileScheduledPushes();
         scheduledPushInterval = setInterval(runScheduledPushes, SCHED_TICK_MS);
+        // Federación: purgar registros de "home" vencidos (TTL) cada hora.
+        setInterval(() => {
+            try {
+                const cutoff = Date.now() - HOME_TTL_MS;
+                persist.deleteExpiredHomes(cutoff);
+                homePubkeys.clear();
+                for (const pk of persist.loadHomes(cutoff)) homePubkeys.add(pk);
+            } catch (e) { console.warn('[fed] purga de homes falló:', e.message); }
+        }, 60 * 60 * 1000).unref();
+        if (PROXY_PEERS.length) console.log(`[fed] federación activa con ${PROXY_PEERS.length} peer(s): ${PROXY_PEERS.join(', ')}`);
 
         const onError = (err) => {
             server.removeListener('error', onError);
