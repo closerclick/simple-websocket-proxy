@@ -760,57 +760,18 @@ function validateChannelFormat(channelData) {
  */
 function validateSignature(channelData) {
     try {
-        const signature = channelData.signature;
-        const data = channelData.data;
-        const publicKeyStr = data.publickey;
-        
-        // Validaciones básicas
-        if (!signature || signature.trim() === '') {
-            return false;
-        }
-        
-        if (!publicKeyStr || publicKeyStr.trim() === '') {
-            return false;
-        }
-        
-        // Verificar formato base64 de la firma
-        const base64Regex = /^[A-Za-z0-9+/]+={0,2}$/;
-        const isBase64 = base64Regex.test(signature);
-        
-        if (!isBase64) {
-            // Podría ser JWK string, verificar si es JSON
-            try {
-                JSON.parse(signature);
-                return false;
-            } catch {
-                // No es JSON válido, pero para desarrollo aceptar
-                return true;
-            }
-        }
-        
-        // Verificar longitud mínima
-        if (signature.length < 10) {
-            return false;
-        }
-        
-        // Intentar verificación criptográfica si la clave pública es JWK
-        try {
-            const publicKeyJson = JSON.parse(publicKeyStr);
-            
-            if (publicKeyJson.kty === 'EC' && publicKeyJson.crv === 'P-256') {
-                // Es una clave JWK ECDSA P-256
-                return verifySignatureWithJWK(data, signature, publicKeyJson);
-            }
-        } catch (jsonError) {
-            // No es JSON, podría ser base64 o string simple
-        }
-        
-        // Fallback a validación básica
-        return validateSignatureBasic(channelData);
-        
-    } catch (error) {
-        // Para desarrollo, aceptar en caso de error
-        return true;
+        const signature = channelData && channelData.signature;
+        const data = channelData && channelData.data;
+        const publicKeyStr = data && data.publickey;
+        if (!signature || typeof signature !== 'string' || !signature.trim()) return false;
+        if (!publicKeyStr || typeof publicKeyStr !== 'string' || !publicKeyStr.trim()) return false;
+        let publicKeyJson;
+        try { publicKeyJson = JSON.parse(publicKeyStr); } catch (_) { return false; }
+        if (publicKeyJson.kty !== 'EC' || publicKeyJson.crv !== 'P-256') return false;
+        // Verificación criptográfica REAL (sin fallbacks de "desarrollo").
+        return verifySignatureWithJWK(data, signature, publicKeyJson);
+    } catch (_) {
+        return false;
     }
 }
 
@@ -823,35 +784,24 @@ function validateSignature(channelData) {
  */
 function verifySignatureWithJWK(data, signatureBase64, publicKeyJwk) {
     try {
-        // Usar serialización canónica (mismo orden que el cliente)
-        const dataStr = canonicalStringify(data);
-        
-        const signatureBuffer = Buffer.from(signatureBase64, 'base64');
-        
-        // Convertir JWK a clave pública de Node.js crypto
-        // JWK a formato PEM para ECDSA
-        const x = Buffer.from(publicKeyJwk.x, 'base64');
-        const y = Buffer.from(publicKeyJwk.y, 'base64');
-        
-        // Crear clave en formato raw (0x04 + x + y)
-        const rawKey = Buffer.concat([Buffer.from([0x04]), x, y]);
-        
-        const verify = crypto.createVerify('SHA256');
-        verify.update(dataStr);
-        verify.end();
-        
-        const result = verify.verify({
-            key: rawKey,
-            format: 'der',
-            type: 'spki',
-            namedCurve: 'prime256v1'
-        }, signatureBuffer);
-        
-        return result;
-        
-    } catch (error) {
-        // Para desarrollo, si hay error en verificación criptográfica, aceptar
-        return true;
+        // ECDSA P-256, firma "raw" r||s de WebCrypto (ieee-p1363), sobre la
+        // serialización canónica. ESTRICTO: cualquier error = firma inválida
+        // (antes devolvía `true` en error → agujero de spoofing de identidad).
+        if (!publicKeyJwk || publicKeyJwk.kty !== 'EC' || publicKeyJwk.crv !== 'P-256' ||
+            !publicKeyJwk.x || !publicKeyJwk.y) return false;
+        if (typeof signatureBase64 !== 'string' || signatureBase64.length < 10) return false;
+        const keyObject = crypto.createPublicKey({
+            key: { kty: 'EC', crv: 'P-256', x: publicKeyJwk.x, y: publicKeyJwk.y },
+            format: 'jwk'
+        });
+        return crypto.verify(
+            'sha256',
+            Buffer.from(canonicalStringify(data), 'utf8'),
+            { key: keyObject, dsaEncoding: 'ieee-p1363' },
+            Buffer.from(signatureBase64, 'base64')
+        );
+    } catch (_) {
+        return false;
     }
 }
 
@@ -927,7 +877,9 @@ const server = http.createServer((req, res) => {
     // Federación: un peer nos reenvía un mensaje por pubkey. Lo entregamos a
     // instancias locales o lo encolamos si somos el home. NO re-reenviamos.
     if (req.url === '/federate' && req.method === 'POST') {
-        if (FED_TOKEN && req.headers['x-proxy-token'] !== FED_TOKEN) { res.writeHead(401); res.end(); return; }
+        // Requiere token SIEMPRE: sin él, /federate sería un inyector de mensajes
+        // abierto (cualquiera encolaría para cualquier identidad con home acá).
+        if (!FED_TOKEN || req.headers['x-proxy-token'] !== FED_TOKEN) { res.writeHead(401); res.end(); return; }
         let size = 0; const chunks = [];
         req.on('data', c => { size += c.length; if (size > 2 * 1024 * 1024) { req.destroy(); } else chunks.push(c); });
         req.on('end', () => {
