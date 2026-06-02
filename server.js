@@ -1805,7 +1805,10 @@ function start(port = Number(PORT)) {
         };
         server.on('error', onError);
 
-        server.listen(port, () => {
+        // HOST opcional: bindear a 127.0.0.1 detrás de nginx (no exponer el puerto
+        // crudo). Sin HOST → todas las interfaces (comportamiento previo).
+        const bindHost = process.env.HOST || undefined;
+        server.listen(port, bindHost, () => {
             server.removeListener('error', onError);
             const actualPort = server.address().port;
             if (process.env.NODE_ENV !== 'test') {
