@@ -1912,18 +1912,23 @@ function getRateLimiter() { return rateLimiter; }
 
 module.exports = { start, stop, server, wss, setRateLimiter, getRateLimiter };
 
-// Manejo de cierre limpio
-process.on('SIGINT', () => {
+// Manejo de cierre limpio. Atendemos SIGINT (Ctrl+C) y SIGTERM: este último es
+// el que manda `systemctl stop/restart`; sin handler, Node lo terminaba pero el
+// servicio quedaba a la espera del TimeoutStopSec (~30-90s) — los deploys del CD
+// (cc-deploy) reiniciaban lentísimo. Con SIGTERM atendido, el restart es inmediato.
+function gracefulShutdown(signal) {
     console.log('\n=========================================');
-    console.log('Recibida señal SIGINT (Ctrl+C)');
+    console.log(`Recibida señal ${signal}`);
     console.log(`Cerrando ${activeConnections.size} conexiones activas...`);
-    
+
     // Cerrar todas las conexiones activas
     for (const [token, conn] of activeConnections) {
         conn.ws.close();
     }
-    
+
     console.log('Servidor cerrado correctamente');
     console.log('=========================================');
     process.exit(0);
-});
+}
+process.on('SIGINT', () => gracefulShutdown('SIGINT (Ctrl+C)'));
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
