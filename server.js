@@ -870,7 +870,13 @@ function validateSignatureBasic(channelData) {
 // Crear servidor HTTP básico (WebSocket upgrade + healthcheck + federación s2s)
 const server = http.createServer((req, res) => {
     if (req.url === '/health') {
-        res.writeHead(200, { 'content-type': 'application/json' });
+        // CORS abierto: /health es una sonda pública (sin datos de usuario) que
+        // los clientes consultan cross-origin (messenger.closer.click → proxy*).
+        // Sin este header el fetch del health-check lo bloquea el navegador.
+        res.writeHead(200, {
+            'content-type': 'application/json',
+            'access-control-allow-origin': '*'
+        });
         res.end(JSON.stringify({ ok: true }));
         return;
     }
