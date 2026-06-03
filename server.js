@@ -970,8 +970,6 @@ wss.on('connection', (ws, req) => {
             const rateCheck = rateLimiter.consume(token, clientIp, messageType);
             usageStats.recordMessage(clientIp, messageType);
             if (rateCheck.status === 'hard_limit') {
-                // Bans deshabilitados: en su lugar contamos en usageStats y
-                // rechazamos solo este mensaje. La conexión se mantiene viva.
                 usageStats.recordHardLimit(clientIp, messageType);
                 const errorResponse = {
                     type: 'error',
@@ -983,6 +981,15 @@ wss.on('connection', (ws, req) => {
                 };
                 applyMessageIds(errorResponse, message);
                 try { ws.send(JSON.stringify(errorResponse)); } catch (_) {}
+                // Por defecto los bans están deshabilitados (RATE_LIMIT_BAN_DISABLED):
+                // `banIp` es noop, no se cierra la conexión y solo se rechaza ESTE
+                // mensaje (throttling "solo rechazo"). Si se habilitan los bans
+                // (RATE_LIMIT_BAN_DISABLED=0), un hard-limit banea la IP y corta la
+                // conexión: esto es lo que detiene un flood/DOS sostenido.
+                rateLimiter.banIp(clientIp);
+                if (rateLimiter.isIpBanned(clientIp)) {
+                    try { ws.close(1008, 'rate limit'); } catch (_) {}
+                }
                 return;
             }
             if (rateCheck.status === 'soft_limit') {

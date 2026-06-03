@@ -104,7 +104,8 @@ describe('rate limiter — hard tier', () => {
                 __global__:    { burst: 1000, ratePerSec: 1000 }
             },
             hardMultiplier: 2, // hard burst = 4
-            banMs: 5000
+            banMs: 5000,
+            banDisabled: false // este test verifica el corte+ban: hay que habilitarlo
         }));
 
         const a = await connectClient(url);

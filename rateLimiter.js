@@ -10,16 +10,22 @@
  * a configurable period (default 30 min).
  */
 
+// Límites "muy generosos": un humano (o una app sana) nunca los toca; solo un
+// flood deliberado (DOS) los cruza. El hard tier (2x) es el que rechaza el
+// mensaje. Los bans/cierre de conexión siguen deshabilitados por defecto
+// (RATE_LIMIT_BAN_DISABLED): el hard-limit solo descarta ESE mensaje y cuenta
+// el evento en usageStats; la conexión se mantiene viva. Override por env
+// RATE_LIMIT_<TYPE>_BURST / _RATE.
 const DEFAULT_LIMITS = {
   // Per-type token buckets: { burst, ratePerSec }
-  message:        { burst: 20, ratePerSec: 8 },
-  publish:        { burst: 5,  ratePerSec: 1 },
-  unpublish:      { burst: 5,  ratePerSec: 1 },
-  list:           { burst: 10, ratePerSec: 2 },
-  list_channels:  { burst: 5,  ratePerSec: 1 },
-  channel_count:  { burst: 60, ratePerSec: 10 },
-  disconnect:     { burst: 5,  ratePerSec: 1 },
-  __global__:     { burst: 60, ratePerSec: 15 }
+  message:        { burst: 120, ratePerSec: 60 },
+  publish:        { burst: 30,  ratePerSec: 10 },
+  unpublish:      { burst: 30,  ratePerSec: 10 },
+  list:           { burst: 60,  ratePerSec: 15 },
+  list_channels:  { burst: 30,  ratePerSec: 8 },
+  channel_count:  { burst: 200, ratePerSec: 50 },
+  disconnect:     { burst: 20,  ratePerSec: 5 },
+  __global__:     { burst: 300, ratePerSec: 120 }
 };
 
 const DEFAULT_HARD_MULTIPLIER = 2;
