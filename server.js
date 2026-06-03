@@ -22,6 +22,12 @@ const publicChannels = new Map();
 const MAX_CHANNEL_ENTRIES = 100;
 const CHANNEL_ENTRY_EXPIRY_MS = 20 * 60 * 1000; // 20 minutos
 
+// Observadores read-only de un canal: channel -> Set<token>. Reciben los eventos
+// joined/left/disconnected del canal SIN figurar como miembros (no aparecen en
+// list()). Pensado para el lobby: ver altas/bajas de salas en vivo sin tener que
+// publicarse como una sala fantasma. (No persistente: se limpia al desconectar.)
+const channelWatchers = new Map();
+
 // ----- Identidad opt-in y cola offline ----------------------------------
 //
 // Un cliente puede llamar a `identify` enviando un sobre firmado
@@ -439,6 +445,13 @@ function removeFromAllPublicChannels(token) {
     }
 }
 
+// Quitar un token de todos los canales que observaba (al desconectar).
+function removeFromAllWatchers(token) {
+    for (const [channel, set] of channelWatchers) {
+        if (set.delete(token) && set.size === 0) channelWatchers.delete(channel);
+    }
+}
+
 // Obtener tokens no expirados de un canal
 function getChannelTokens(channel) {
     if (!publicChannels.has(channel)) {
@@ -525,7 +538,25 @@ function notifyPairedClients(disconnectedToken, skipTokens = new Set()) {
 }
 
 // Notificar a los miembros existentes del canal que un token nuevo se publicó
+// Notificar a los observadores read-only de un canal (channelWatchers). Reciben
+// el mismo frame que los miembros (joined/left/disconnected) pero no figuran en
+// la lista. `excludeToken` evita avisarle al propio sujeto del evento.
+function notifyWatchers(channelName, frame, excludeToken) {
+    const set = channelWatchers.get(channelName);
+    if (!set || set.size === 0) return 0;
+    let notified = 0;
+    for (const watcherToken of set) {
+        if (watcherToken === excludeToken) continue;
+        const conn = activeConnections.get(watcherToken);
+        if (conn && conn.ws.readyState === WebSocket.OPEN) {
+            try { conn.ws.send(JSON.stringify(frame)); notified++; } catch (_) {}
+        }
+    }
+    return notified;
+}
+
 function notifyChannelMembersOfJoin(joiningToken, channelName) {
+    notifyWatchers(channelName, { type: 'joined', token: joiningToken, channel: channelName, timestamp: new Date().toISOString() }, joiningToken);
     const entries = publicChannels.get(channelName);
     if (!entries) return 0;
 
@@ -552,6 +583,7 @@ function notifyChannelMembersOfJoin(joiningToken, channelName) {
 
 // Notificar a los miembros restantes del canal que un token se despublicó
 function notifyChannelMembersOfLeave(leavingToken, channelName) {
+    notifyWatchers(channelName, { type: 'left', token: leavingToken, channel: channelName, timestamp: new Date().toISOString() }, leavingToken);
     const entries = publicChannels.get(channelName);
     if (!entries) return 0;
 
@@ -586,6 +618,9 @@ function notifyChannelMembersOfDisconnect(disconnectedToken) {
         // ¿El token desconectado estaba publicado en este canal?
         const isInChannel = entries.some(entry => entry.token === disconnectedToken);
         if (!isInChannel) continue;
+
+        // Observadores read-only del canal también deben enterarse de la baja.
+        notifyWatchers(channelName, { type: 'disconnected', token: disconnectedToken, channel: channelName, timestamp }, disconnectedToken);
 
         // Notificar a cada miembro restante del canal
         for (const entry of entries) {
@@ -1008,6 +1043,12 @@ wss.on('connection', (ws, req) => {
             } else if (message.type === 'list') {
                 handleListMessage(ws, message);
                 return;
+            } else if (message.type === 'watch') {
+                handleWatchMessage(ws, message);
+                return;
+            } else if (message.type === 'unwatch') {
+                handleUnwatchMessage(ws, message);
+                return;
             } else if (message.type === 'channel_count') {
                 handleChannelCountMessage(ws, message);
                 return;
@@ -1277,7 +1318,41 @@ wss.on('connection', (ws, req) => {
         
         if (process.env.NODE_ENV !== 'test') console.log(`Cliente ${token} solicitó lista del canal ${channelName}: ${tokens.length} tokens`);
     }
-    
+
+    // Observar un canal (read-only): registra interés en sus eventos joined/left/
+    // disconnected SIN publicarse como miembro. Devuelve la lista actual de tokens
+    // para que el cliente tenga el estado inicial + luego los eventos en vivo.
+    function handleWatchMessage(ws, message) {
+        const validation = validateChannelFormat(message.channel);
+        if (!validation.valid) {
+            const e = { type: 'error', error: validation.error };
+            applyMessageIds(e, message); ws.send(JSON.stringify(e)); return;
+        }
+        const channelName = validation.channelName;
+        let set = channelWatchers.get(channelName);
+        if (!set) { set = new Set(); channelWatchers.set(channelName, set); }
+        set.add(token);
+        const tokens = getChannelTokens(channelName);
+        const response = { type: 'watched', channel: channelName, tokens, count: tokens.length, timestamp: new Date().toISOString() };
+        applyMessageIds(response, message);
+        ws.send(JSON.stringify(response));
+        if (process.env.NODE_ENV !== 'test') console.log(`Cliente ${token} observa el canal ${channelName} (${tokens.length} tokens)`);
+    }
+
+    function handleUnwatchMessage(ws, message) {
+        const validation = validateChannelFormat(message.channel);
+        if (!validation.valid) {
+            const e = { type: 'error', error: validation.error };
+            applyMessageIds(e, message); ws.send(JSON.stringify(e)); return;
+        }
+        const channelName = validation.channelName;
+        const set = channelWatchers.get(channelName);
+        if (set) { set.delete(token); if (set.size === 0) channelWatchers.delete(channelName); }
+        const response = { type: 'unwatched', channel: channelName, timestamp: new Date().toISOString() };
+        applyMessageIds(response, message);
+        ws.send(JSON.stringify(response));
+    }
+
     function handleListChannelsMessage(ws, message) {
         const prefix = (typeof message.prefix === 'string') ? message.prefix : null;
         const now = Date.now();
@@ -1771,6 +1846,9 @@ wss.on('connection', (ws, req) => {
 
             // Remover de todos los canales públicos inmediatamente
             removeFromAllPublicChannels(token);
+
+            // Remover de los canales que observaba (read-only)
+            removeFromAllWatchers(token);
 
             if (process.env.NODE_ENV !== 'test') console.log(`Cliente desconectado - Token: ${token}. Notificados: ${notifiedByChannels.size} por canal + ${notifiedByPairs} por par. Total activos: ${activeConnections.size}`);
         }
