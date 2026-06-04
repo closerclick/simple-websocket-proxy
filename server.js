@@ -1000,6 +1000,14 @@ wss.on('connection', (ws, req) => {
             // Actualizar actividad del token
             tokenManager.updateTokenActivity(token);
 
+            // Heartbeat de aplicación: el cliente manda `{type:'ping'}` cada ~20s y
+            // espera respuesta; sin ella detecta una conexión half-open y reconecta.
+            // Respondemos antes del rate-limit (keepalive gratis) y cortamos acá.
+            if (message.type === 'ping') {
+                try { ws.send(JSON.stringify({ type: 'pong' })); } catch (_) {}
+                return;
+            }
+
             // Rate limiting (per-token + per-type, dos niveles)
             const messageType = message.type || 'message';
             const rateCheck = rateLimiter.consume(token, clientIp, messageType);
